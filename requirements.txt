@@ -1,0 +1,25 @@
+sae-lens==6.25.0
+sae_bench @ git+https://github.com/adamkarvonen/SAEBench@fbc649fd2c336f5a383ff6840ecac740d485f3d6
+torch==2.9.0
+transformer-lens==2.16.1
+transformers==4.56.2
+datasets==3.6.0
+safetensors
+einops
+numpy==1.26.4
+scipy
+scikit-learn
+pandas
+statsmodels
+matplotlib
+seaborn
+plotly
+tqdm
+wandb
+
+# analysis/cluster_decoders.py (Leiden clustering of decoder atoms)
+python-igraph
+leidenalg
+
+# eval/run_autointerp.py (explanation + judge calls)
+openai

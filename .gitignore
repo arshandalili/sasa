@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.cache/
+.ipynb_checkpoints/
+wandb/
+scratch/
+results/
+checkpoints/*
+!checkpoints/topk_sasa_gpt2_l7_n2048_r6_k10/
+output/
+# probe activations: 134 MB, rebuilt by scripts/rebuild_probe_activations.py
+artifacts/**/data.npz
+# per-run eval scratch
+artifacts/absorption/*_k_sparse_probing.json
