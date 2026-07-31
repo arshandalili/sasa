@@ -98,10 +98,6 @@ python -m scripts.rebuild_probe_activations
 python -m eval.run_absorption --sae topk_sasa_gpt2_l7_n2048_r6_k10 --label sasa_paper
 ```
 
-The probes are a property of GPT-2, not of any SAE. SAEBench regenerates them when absent,
-but its own eligibility gate then discards enough letters that results shift, so use the
-shipped ones. `--probes-dir` points elsewhere; `scripts.install_probe_cache` copies a
-complete cache from an existing SAEBench install instead of rebuilding.
 
 AutoInterp:
 
