@@ -5,12 +5,6 @@ on the block's norm (Top-`s` over group norms), and regularizes the block with a
 trace-norm penalty. A model is `(K, r, s)`: `K` groups of rank `r`, `s` active per token,
 so the dictionary has `m = Kr` columns and `l0 = sr`.
 
-```text
-sasa/model.py       the model               eval/         core, absorption, AutoInterp
-scripts/            cache, train            analysis/     rank, decoder clusters, Figure 3
-checkpoints/        GPT-2 layer-7 model     experiments/  theory, causal, population splitting
-```
-
 ## Setup
 
 ```bash
