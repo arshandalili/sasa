@@ -30,9 +30,6 @@ one group of effective rank `d_i`. `experiments/synthetic_dimension.py` reproduc
 ## Setup
 
 ```bash
-git lfs install
-git lfs pull
-
 uv venv .venv --python 3.10
 source .venv/bin/activate
 uv pip install -r requirements.txt
@@ -43,9 +40,25 @@ export SASA_RESULTS=$PWD/results
 export SASA_CACHE_ROOT=$PWD/.cache
 ```
 
-`git lfs pull` fetches the two large files kept out of ordinary git history: the probe
-activation cache used by the absorption eval, and the Mistral-7B checkpoint used by the
-causal intervention. Run everything as a module from this directory.
+Run everything as a module from this directory.
+
+## Large files
+
+Two files are too big for ordinary git and are stored with Git LFS. If `git-lfs` was not
+installed on the machine when you cloned, they arrive as small text pointers instead of
+real data and the commands that read them fail on a malformed-file error:
+
+```bash
+git lfs install
+git lfs pull
+```
+
+| file | size | needed by |
+| --- | --- | --- |
+| `artifacts/absorption/probes/gpt2/layer_7/data.npz` | 134 MB | `eval/absorption.py` |
+| `checkpoints/topk_sasa_mistral7b_l19_n8192_r4_k15/sae_weights.safetensors` | 1.1 GB | the causal intervention |
+
+Everything else is ordinary git, so the GPT-2 checkpoints and the rest of the commands work without LFS. If you would rather not install it, `python -m scripts.rebuild_probe_activations` regenerates the probe cache from the shipped CSVs in one GPT-2 pass; the Mistral checkpoint has no such fallback and would have to be retrained.
 
 ## Cache
 
@@ -171,13 +184,7 @@ intervening on the group and reading the effect off the model's own predictions.
 on Mistral-7B v0.1 at `blocks.19.hook_resid_post`.
 
 `checkpoints/topk_sasa_mistral7b_l19_n8192_r4_k15` is the model behind these numbers
-(`K=8192, r=4, s=15`, so `m=32768`, `l0=60`). It is 1.1 GB and ships through Git LFS, so
-fetch it once after cloning:
-
-```bash
-git lfs install
-git lfs pull
-```
+(`K=8192, r=4, s=15`, so `m=32768`, `l0=60`); it comes down with `git lfs pull`.
 
 `screen.py` ranks groups per concept by synthetic AUC, keeping those above 0.80 corpus AUC
 on a held-out Pile slice; the top group per concept is `--g-*` and the second-best is the
