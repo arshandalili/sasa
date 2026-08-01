@@ -64,6 +64,8 @@ Everything else is ordinary git, so the GPT-2 checkpoints and the rest of the co
 
 Cache the activation stream once, every model then reads the same tokens in the same order.
 
+**NOTE: THIS COMMAND WILL GENERATE FILES IN ORDER OF 800GB.**
+
 ```bash
 python -m scripts.cache_activations \
   --model-name gpt2 --hook-name blocks.7.hook_resid_pre --d-in 768 \
