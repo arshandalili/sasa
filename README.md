@@ -131,6 +131,16 @@ if you ever need to.
 python -m eval.absorption --sae topk_sasa_gpt2_l7_r6_nuc100_l060 --label sasa_l060
 ```
 
+Three scores come out of a run. Absorption fraction is how much of a letter's probe
+direction ends up carried by latents other than the one that should own it. Full absorption
+is the all-or-nothing version, counting only the cases where the owning latent stays silent
+altogether. Split features is how many latents a single letter is spread across.
+
+Absorption fraction is the one to compare architectures on. The other two turn on whether a
+particular unit fired, and at a matched column budget SASA fires `s` groups per token where
+a scalar SAE fires `l0` latents, so they partly measure that difference in gating rather
+than absorption.
+
 The temporal subspace of Figure 3. Group 1473 spans years; the three panels are its
 explained-variance spectrum, the 3D PCA of the year directions, and the circular fit:
 
