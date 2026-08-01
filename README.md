@@ -61,7 +61,7 @@ python -m scripts.cache_activations \
 
 ## Train
 
-The paper's GPT-2 model:
+A single GPT-2 SASA model:
 
 ```bash
 python -m scripts.train_sasa \
@@ -105,7 +105,7 @@ GPT-2 SAE `gpt2-small-res-jb` at the same hook:
 
 ```bash
 python -m eval.run_core \
-  --topk-sasa-dir checkpoints/topk_sasa_gpt2_l7_n2048_r6_k10 \
+  --topk-sasa-dir checkpoints/topk_sasa_gpt2_l7_r6_nuc100_l060 \
   --hook blocks.7.hook_resid_pre
 ```
 
@@ -117,22 +117,6 @@ if you ever need to.
 ```bash
 python -m eval.absorption --sae topk_sasa_gpt2_l7_r6_nuc100_l060 --label sasa_l060
 ```
-
-Activations are read at the SAE's own hook. The score is not scale-invariant, so SASA
-latents are rescaled by the per-token `ln_std` back to raw activation units and every
-architecture is scored on one scale; `--no-raw-scale` turns that off.
-
-The matched-budget sweep, mean absorption fraction, lower is better:
-
-| `l0` | SASA | TopK | BatchTopK | Matryoshka |
-| --- | --- | --- | --- | --- |
-| 30 | **0.046** | 0.092 | 0.093 | 0.130 |
-| 60 | **0.068** | 0.097 | 0.191 | 0.140 |
-| 120 | **0.022** | 0.131 | 0.339 | 0.403 |
-| 240 | **0.096** | 0.178 | 0.262 | 0.394 |
-
-The metric carries about +-0.03 absolute run to run, so read the ordering rather than
-individual cells.
 
 The temporal subspace of Figure 3. Group 1473 spans years; the three panels are its
 explained-variance spectrum, the 3D PCA of the year directions, and the circular fit:
@@ -146,7 +130,7 @@ AutoInterp:
 
 ```bash
 python -m eval.run_autointerp --sae-dir checkpoints/topk_sasa_gpt2_l7_n2048_r6_k10 \
-  --label sasa_paper --api-key-file openai_key.txt
+  --label sasa_l060 --api-key-file openai_key.txt
 ```
 
 For SASA the unit this evaluates is the *group*, whose activation is the group norm
