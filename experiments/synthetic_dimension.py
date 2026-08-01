@@ -1,4 +1,4 @@
-"""tXJ7 Q1: vary intrinsic feature dimension d_i with every other factor fixed."""
+"""Vary intrinsic feature dimension d_i with every other factor fixed."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from sae_lens.saes.sae import SAEMetadata, TrainStepInput  # noqa: E402
 from sasa.model import TopKSASA, TopKSASAConfig  # noqa: E402
 
 
-REPORT_DIR = PATHS.reports_root / "txj7_q1_splitting"
+REPORT_DIR = PATHS.reports_root / "synthetic_dimension_splitting"
 DIMS = (1, 2, 3, 4, 6, 8, 12, 16)
 EPS_GRID = (0.5, 0.3)
 K_GRID = (1, 2, 4, 8)

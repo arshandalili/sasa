@@ -15,8 +15,12 @@ checkpoints/*
 !checkpoints/batchtopk_gpt2_l7_l0*/
 !checkpoints/matryoshka_gpt2_l7_l0*/
 !checkpoints/topk_sasa_gpt2_l7_r6_nuc100_l0*/
+!checkpoints/topk_sasa_mistral7b_l19_*/
 output/
-# probe activations: 134 MB, rebuilt by scripts/rebuild_probe_activations.py
-artifacts/**/data.npz
 # per-run eval scratch
 artifacts/absorption/*_k_sparse_probing.json
+
+# API keys - never commit
+openai.txt
+openai_key.txt
+*.key

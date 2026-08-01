@@ -66,7 +66,7 @@ def _load_local_autointerp_sae(
     device: str,
     feature_mode: str,
 ) -> Any:
-    from run_saebench_core_gpt2 import SAEBenchAdapter, _canonicalize_model_name_for_saebench
+    from eval._common import SAEBenchAdapter, _canonicalize_model_name_for_saebench
 
     register_topk_sasa_classes()
     _require_local_sae_dir(sae_dir, role=f"AutoInterp {feature_mode}")
@@ -360,7 +360,7 @@ def run_single_target(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run SAEBench AutoInterp for GPT-2 SAEs, including the matched-budget rebuttal panel."
+        description="Run SAEBench AutoInterp for GPT-2 SAEs, including the matched-budget panel."
     )
     parser.add_argument("--mode", choices=["single", "panel"], default="single")
     parser.add_argument("--target", type=str, default=None)

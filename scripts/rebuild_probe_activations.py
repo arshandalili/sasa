@@ -56,7 +56,7 @@ def main() -> None:
     import torch
     from transformer_lens import HookedTransformer
 
-    probe_dir = DEST / probe_subdir(args.model, args.hook, args.layer)
+    probe_dir = DEST / probe_subdir(args.model, args.layer)
     if not (probe_dir / "train_df.csv").exists():
         raise SystemExit(f"{probe_dir} has no train_df.csv; nothing to rebuild from.")
 

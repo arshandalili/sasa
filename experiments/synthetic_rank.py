@@ -1,4 +1,4 @@
-"""Experiment B -- synthetic planted-dimension recovery (AC#3 / Reviewer Jpqd)."""
+"""Synthetic planted-dimension recovery: does the nuclear penalty find the true rank?"""
 
 from __future__ import annotations
 
@@ -163,7 +163,7 @@ def train_one(
                 ev = 1.0 - (
                     (out.sae_out - x).pow(2).sum() / (x - x.mean(0)).pow(2).sum()
                 ).item()
-            hist.append({"step": step, "loss": float(out.loss), "explained_variance": ev})
+            hist.append({"step": step, "loss": out.loss.item(), "explained_variance": ev})
     return sae, {"history": hist, "explained_variance": hist[-1]["explained_variance"]}
 
 

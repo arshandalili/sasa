@@ -12,16 +12,12 @@ from pathlib import Path
 import torch
 from sae_lens import SAE
 
-import sae_bench.evals.core.main as core_main
-import sae_bench.sae_bench_utils.general_utils as sb_general_utils
-
 
 def _set_hf_cache_defaults(workspace_root: Path) -> None:
     cache_root = workspace_root / ".cache"
     # Set explicitly, not setdefault: clusters often pre-point these at a quota-limited $HOME.
     os.environ["HF_HOME"] = str(cache_root / "hf")
     os.environ["HF_DATASETS_CACHE"] = str(cache_root / "hf_datasets")
-    os.environ["TRANSFORMERS_CACHE"] = str(cache_root / "hf_transformers")
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_root / "hf_hub")
     os.environ["XDG_CACHE_HOME"] = str(cache_root)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"

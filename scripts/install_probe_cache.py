@@ -25,8 +25,8 @@ DEST = REPO_ROOT / "artifacts" / "absorption" / "probes"
 NEEDED = ("probe.pth", "data.npz", "train_df.csv", "test_df.csv")
 
 
-def probe_subdir(model: str, hook: str, layer: int) -> Path:
-    return Path(model) / hook.replace("/", "_").replace(".", "_") / f"layer_{layer}"
+def probe_subdir(model: str, layer: int) -> Path:
+    return Path(model) / f"layer_{layer}"
 
 
 def install(src_dir: Path, dest_dir: Path) -> None:
@@ -48,11 +48,10 @@ def main() -> None:
     ap.add_argument("--source", required=True,
                     help="SAEBench probes directory, i.e. <sae_bench>/artifacts/absorption/probes")
     ap.add_argument("--model", default="gpt2")
-    ap.add_argument("--hook", default="blocks.7.hook_resid_pre")
     ap.add_argument("--layer", type=int, default=7)
     args = ap.parse_args()
 
-    rel = probe_subdir(args.model, args.hook, args.layer)
+    rel = probe_subdir(args.model, args.layer)
     src = Path(args.source) / rel
     if not src.exists():
         raise SystemExit(f"{src} does not exist")

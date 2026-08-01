@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
 
 import torch
@@ -117,4 +119,8 @@ def main() -> None:
 if __name__ == "__main__":
     _ = sb_general_utils.setup_environment()
     main()
+    # torch's CUDA teardown aborts on this machine once the results are written; the
+    # work is already flushed to disk, so exit before finalization runs.
+    sys.stdout.flush()
+    os._exit(0)
 

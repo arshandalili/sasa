@@ -19,7 +19,6 @@ wandb_root.mkdir(parents=True, exist_ok=True)
 tmp_root.mkdir(parents=True, exist_ok=True)
 os.environ["HF_HOME"] = str(cache_root / "hf")
 os.environ["HF_DATASETS_CACHE"] = str(cache_root / "hf_datasets")
-os.environ["TRANSFORMERS_CACHE"] = str(cache_root / "hf_transformers")
 os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_root / "hf_hub")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -30,7 +29,7 @@ os.environ["WANDB_DATA_DIR"] = str(wandb_root / "data")
 os.environ["TMPDIR"] = str(tmp_root)
 os.environ["TEMP"] = str(tmp_root)
 os.environ["TMP"] = str(tmp_root)
-for d in ["hf", "hf_datasets", "hf_transformers", "hf_hub"]:
+for d in ["hf", "hf_datasets", "hf_hub"]:
     (cache_root / d).mkdir(parents=True, exist_ok=True)
 for d in ["cache", "config", "data"]:
     (wandb_root / d).mkdir(parents=True, exist_ok=True)

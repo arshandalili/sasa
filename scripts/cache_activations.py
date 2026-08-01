@@ -10,11 +10,10 @@ tmp_root = cache_root / "tmp"
 tmp_root.mkdir(parents=True, exist_ok=True)
 os.environ["HF_HOME"] = str(cache_root / "hf")
 os.environ["HF_DATASETS_CACHE"] = str(cache_root / "hf_datasets")
-os.environ["TRANSFORMERS_CACHE"] = str(cache_root / "hf_transformers")
 os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_root / "hf_hub")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TMPDIR"] = str(tmp_root)
-for d in ["hf", "hf_datasets", "hf_transformers", "hf_hub"]:
+for d in ["hf", "hf_datasets", "hf_hub"]:
     (cache_root / d).mkdir(parents=True, exist_ok=True)
 
 import datasets.config

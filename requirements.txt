@@ -1,3 +1,4 @@
+# Requires Python >=3.10; sae-lens has no 3.9 release.
 sae-lens==6.25.0
 sae_bench @ git+https://github.com/adamkarvonen/SAEBench@fbc649fd2c336f5a383ff6840ecac740d485f3d6
 torch==2.9.0
@@ -16,10 +17,7 @@ seaborn
 plotly
 tqdm
 wandb
-
-# analysis/cluster_decoders.py (Leiden clustering of decoder atoms)
 python-igraph
 leidenalg
-
-# eval/run_autointerp.py (explanation + judge calls)
 openai
+zstandard
