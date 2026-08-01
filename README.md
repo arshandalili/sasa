@@ -45,12 +45,7 @@ export SASA_CACHE_ROOT=$PWD/.cache
 
 `git lfs pull` fetches the two large files kept out of ordinary git history: the probe
 activation cache used by the absorption eval, and the Mistral-7B checkpoint used by the
-causal intervention.
-
-Run everything as a module from this directory.
-`checkpoints/topk_sasa_gpt2_l7_n2048_r6_k10` is the GPT-2 layer-7 model behind Tables 1-3
-(`K=2048, r=6, s=10`, so `m=12288`, `l0=60`), so the eval commands below work without
-training anything first.
+causal intervention. Run everything as a module from this directory.
 
 ## Cache
 
