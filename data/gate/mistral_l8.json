@@ -1,0 +1,9 @@
+{
+ "sasa_r8_k10": {
+  "threshold": 6.247275173664093,
+  "k": 10,
+  "n_tokens": 98304,
+  "calibration": "pile-10k, 24 batches of 4096 tokens, context 512",
+  "sha256": "a55abf51f68d94ec848770481a245b8ac6ae320250c261011227996a4bf2bb81"
+ }
+}

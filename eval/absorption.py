@@ -1,395 +1,474 @@
-"""First-letter feature absorption, ported from SAEBench and computed locally."""
-
-from __future__ import annotations
-
 import argparse
+import gc
+import gzip
 import json
-import pickle
 import random
 import re
-import statistics
-import sys
-import tempfile
-import types
-import warnings
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+from sae_bench.evals.absorption.probing import train_multi_probe
+from sae_bench.evals.absorption.prompting import create_icl_prompt, first_letter_formatter
+from sae_bench.evals.absorption.vocab import get_alpha_tokens
+from sklearn import metrics
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score
-from torch import nn
+from transformer_lens import HookedTransformer
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from eval import _common as adapter_mod  # noqa: E402
-from paths import CHECKPOINTS, RESULTS  # noqa: E402
+import paths
+from configs import load_config
+from eval.dictionaries import EngelsReLU, load_sae
+from eval.gate import gate_threshold
+from eval.member_prediction import family_state_files
 
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
-PROBES_DIR = REPO_ROOT / "artifacts" / "absorption" / "probes"
-REPORT_DIR = RESULTS / "absorption"
-
+# SAEBench's first-letter benchmark (AbsorptionEvalConfig, feature_absorption_calculator.py, k_sparse_probing.py)
 PROMPT_TEMPLATE = "{word} has the first letter:"
-PROMPT_TOKEN_POS = -6
-ICL_EXAMPLES = 10
-
-MAX_K = 10
-F1_JUMP_THRESHOLD = 0.03
-MIN_GT_PROBE_F1 = 0.6
-MIN_FEATS_FOR_EVAL = 20
-L1_DECAY = 0.01
-L1_PROBE_EPOCHS = 50
-L1_PROBE_BATCH = 4096
-
-TOPK_FEATS = 10
-FULL_ABSORPTION_COS_THRESHOLD = 0.025
-ABSORPTION_FRACTION_COS_THRESHOLD = 0.1
-PROBE_PROJECTION_PROPORTION_THRESHOLD = 0.4
-MAX_ABSORBING_LATENTS = 3
-EPS = 1e-8
+WORD_POSITION = -6
+SILENT = 1e-8
+ABSORBER_COSINE, FULL_ABSORBER_COSINE = 0.1, 0.025
+ABSORBED_SHARE = 0.4
+N_ABSORBERS = 3
+F1_GAIN = 0.03
+MAX_MAIN_UNITS = 10
+MIN_PROBE_F1, MIN_ELIGIBLE = 0.6, 20
+SPARSE_PROBE_L1 = 0.01
+N_BACKGROUND = 20000
+PROBE_SET_BATCH, PROMPT_BATCH, PROBE_EVAL_BATCH, CODE_BATCH = 64, 32, 24, 4096
 
 
-def patch_adapter_encode_to_raw_scale() -> None:
-    if getattr(adapter_mod.SAEBenchAdapter, "_raw_scale_patched", False):
-        return
-    original_encode = adapter_mod.SAEBenchAdapter.encode
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        z = original_encode(self, x)
-        if str(getattr(self.sae.cfg, "normalize_activations", "none")) != "layer_norm":
-            return z
-        ln_std = getattr(self.sae, "ln_std", None)
-        if ln_std is None:
-            raise RuntimeError("layer_norm SAE did not expose ln_std after encode.")
-        rows = int(torch.tensor(z.shape[:-1]).prod().item())
-        if ln_std.numel() != rows:
-            raise RuntimeError(
-                f"ln_std has {ln_std.numel()} entries but encode returned {rows} rows."
-            )
-        scale = ln_std.reshape(*z.shape[:-1], 1).to(device=z.device, dtype=z.dtype)
-        return z * scale
-
-    adapter_mod.SAEBenchAdapter.encode = encode
-    adapter_mod.SAEBenchAdapter._raw_scale_patched = True
-
-
-def load_adapter(sae_dir: Path, device: str):
-    from sae_lens import SAE, register_sae_class
-
-    from sasa import TopKSASAInference, TopKSASAInferenceConfig
-
-    try:
-        register_sae_class("topk_sasa", TopKSASAInference, TopKSASAInferenceConfig)
-    except ValueError:
-        pass
-
-    try:
-        sae = SAE.load_from_disk(str(sae_dir), device=device)
-    except KeyError:
-        # BatchTopK/Matryoshka save as jumprelu; convert if given a training checkpoint.
-        from sae_lens.saes.sae import TrainingSAE
-
-        training_sae = TrainingSAE.load_from_disk(str(sae_dir), device=device)
-        converted = Path(tempfile.mkdtemp(prefix="sasa_infer_"))
-        training_sae.save_inference_model(str(converted))
-        del training_sae
-        sae = SAE.load_from_disk(str(converted), device=device)
-
-    adapter_mod._canonicalize_model_name_for_saebench(sae)
-
-    n_groups = getattr(sae, "n_groups", None) or getattr(sae.cfg, "n_groups", None)
-    group_rank = getattr(sae, "group_rank", None) or getattr(sae.cfg, "group_rank", None)
-    return adapter_mod.SAEBenchAdapter(
-        sae,
-        match_token_norm=False,
-        n_groups=int(n_groups) if n_groups is not None else None,
-        group_rank=int(group_rank) if group_rank is not None else None,
-    )
-
-
-class LinearProbe(nn.Module):
-    def __init__(self, input_dim: int, num_outputs: int = 1):
-        super().__init__()
-        self.fc = nn.Linear(input_dim, num_outputs)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x)
-
-    @property
-    def weights(self) -> torch.Tensor:
-        return self.fc.weight
-
-
-class _ProbeUnpickler(pickle.Unpickler):
-    def find_class(self, module: str, name: str):
-        return LinearProbe if name == "LinearProbe" else super().find_class(module, name)
-
-
-def load_ground_truth_probe(probe_dir: Path, device: str) -> LinearProbe:
-    """probe.pth is a pickled SAEBench LinearProbe; rebind it onto the local class."""
-    shim = types.ModuleType("absorption_probe_pickle")
-    shim.Unpickler, shim.load = _ProbeUnpickler, pickle.load
-    probe = torch.load(
-        probe_dir / "probe.pth", map_location=device, pickle_module=shim, weights_only=False
-    )
-    return probe.float().eval()
-
-
-def load_split(probe_dir: Path, split: str, tokenizer, device: str):
-    data = np.load(probe_dir / "data.npz")
-    df = pd.read_csv(probe_dir / f"{split}_df.csv", keep_default_na=False, na_values=[""])
-    tokens = df["token"].tolist()
-    keep = [
-        i for i, t in enumerate(tokens)
-        if isinstance(t, str) and not re.match(r"[\d<>]", t)
-    ]
-    acts = torch.from_numpy(data[f"X_{split}"][keep]).to(device=device, dtype=torch.float32)
-    words = [tokenizer.convert_tokens_to_string([tokens[i]]) for i in keep]
-    return acts, words, data[f"y_{split}"][keep]
-
-
-@torch.no_grad()
-def encode_all(sae, acts: torch.Tensor, batch_size: int = L1_PROBE_BATCH) -> torch.Tensor:
-    return torch.cat([sae.encode(batch) for batch in acts.split(batch_size)])
-
-
-def train_l1_probe(latents: torch.Tensor, labels: np.ndarray) -> torch.Tensor:
-    """26-way one-vs-rest logistic probe on SAE latents, L1-penalised, for feature selection."""
-    device = latents.device
-    y = nn.functional.one_hot(torch.from_numpy(labels), len(LETTERS)).to(device, torch.float32)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=(len(y) - y.sum(0)) / y.sum(0))
-    probe = LinearProbe(latents.shape[-1], len(LETTERS)).to(device)
-    opt = torch.optim.Adam(probe.parameters(), lr=0.01, weight_decay=1e-6)
-    sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=(1e-5 / 0.01) ** (1 / L1_PROBE_EPOCHS))
-    for _ in range(L1_PROBE_EPOCHS):
-        for idx in torch.randperm(len(latents), device=device).split(L1_PROBE_BATCH):
-            opt.zero_grad()
-            loss = loss_fn(probe(latents[idx]), y[idx])
-            loss = loss + L1_DECAY * probe.weights.abs().sum(dim=-1).mean()
-            loss.backward()
-            opt.step()
-        sched.step()
-    return probe.weights.detach()
-
-
-def train_k_sparse_probes(l1_weights: torch.Tensor, latents: np.ndarray, labels: np.ndarray):
-    probes = {}
-    for letter_i in range(len(LETTERS)):
-        feats = l1_weights[letter_i].topk(MAX_K).indices.cpu().numpy()
-        y = (labels == letter_i).astype(np.int64)
-        for k in range(1, MAX_K + 1):
-            ids = feats[:k]
-            fit = LogisticRegression(max_iter=500, class_weight="balanced").fit(latents[:, ids], y)
-            probes[letter_i, k] = (ids, fit.coef_[0].astype(np.float32), float(fit.intercept_[0]))
-    return probes
-
-
-def letter_metrics(probes, latents: np.ndarray, labels: np.ndarray, probe_scores: np.ndarray):
-    """Ground-truth probe F1 plus the split latents, i.e. the k-sparse probe's feature set at
-    the largest k that still bought an F1 jump."""
-    rows = []
-    for letter_i, letter in enumerate(LETTERS):
-        y = labels == letter_i
-        split_feats, best = [], -100.0
-        for k in range(1, MAX_K + 1):
-            ids, weight, bias = probes[letter_i, k]
-            f1 = f1_score(y, latents[:, ids] @ weight + bias > 0, zero_division=0)
-            if f1 <= best + F1_JUMP_THRESHOLD:
-                break
-            best, split_feats = f1, ids.tolist()
-        rows.append({
-            "letter": letter,
-            "f1_probe": f1_score(y, probe_scores[:, letter_i] > 0, zero_division=0),
-            "split_feats": split_feats,
-        })
-    return rows
-
-
-def get_alpha_tokens(tokenizer) -> list[str]:
-    alpha = set(LETTERS + LETTERS.upper())
-    words = []
-    for token in tokenizer.vocab:
-        word = tokenizer.convert_tokens_to_string([token])
-        body = word[1:] if word.startswith(" ") else word
-        if body and all(char in alpha for char in body):
-            words.append(word)
-    return words
-
-
-def icl_prompt(word: str, vocab: list[str]) -> str:
-    while True:
-        examples = random.sample(vocab, ICL_EXAMPLES)
-        if word not in examples:
-            break
-    shots = [PROMPT_TEMPLATE.format(word=w) + " " + w.strip()[0].upper() for w in examples]
-    return "\n" + "\n".join(shots) + "\n" + PROMPT_TEMPLATE.format(word=word)
-
-
-def absorption_fraction(proj: torch.Tensor, act_proj: float, cos: torch.Tensor,
-                        main_feats: list[int]) -> float:
-    main_proj = proj[main_feats].sum().item()
-    candidates = torch.ones_like(proj, dtype=torch.bool)
-    candidates[main_feats] = False
-    candidates &= cos >= ABSORPTION_FRACTION_COS_THRESHOLD
-    candidates &= proj > 0
-    pool = proj[candidates]
-    absorber_proj = pool.topk(min(MAX_ABSORBING_LATENTS, pool.numel())).values.sum().item()
-    if (main_proj >= act_proj
-            or absorber_proj / act_proj < PROBE_PROJECTION_PROPORTION_THRESHOLD):
-        return 0.0
-    if main_proj <= 0.0:
-        return 1.0
-    absorbed = min(absorber_proj, act_proj - main_proj)
-    return float(np.clip(absorbed / (absorbed + main_proj), 0.0, 1.0))
-
-
-def is_full_absorption(proj: torch.Tensor, act_proj: float, cos: torch.Tensor,
-                       latents: torch.Tensor, main_feats: list[int]) -> bool:
-    if (latents[main_feats] >= EPS).any().item():
-        return False
-    top = proj.topk(TOPK_FEATS).indices[0].item()
-    if cos[top].item() < FULL_ABSORPTION_COS_THRESHOLD or act_proj < 0:
-        return False
-    return proj[top].item() / act_proj >= PROBE_PROJECTION_PROPORTION_THRESHOLD
-
-
-@torch.no_grad()
-def score_letter(model, sae, hook: str, direction: torch.Tensor, main_feats: list[int],
-                 words: list[str], vocab: list[str], batch_size: int):
-    direction = (direction / direction.norm()).to(sae.device)
-    cos = nn.functional.cosine_similarity(direction, sae.W_dec, dim=-1).float().cpu()
-    prompts = [icl_prompt(word, vocab) for word in words]
-    if len({len(ids) for ids in model.tokenizer(prompts)["input_ids"]}) > 1:
-        raise ValueError("all prompts for a letter must have the same token length")
-
-    fractions, full = [], []
-    for start in range(0, len(prompts), batch_size):
-        batch = prompts[start:start + batch_size]
-        acts = model.run_with_cache(batch, names_filter=[hook])[1][hook][:, PROMPT_TOKEN_POS, :]
-        latents = sae.encode(acts).float().cpu()
-        proj = latents * cos
-        act_proj = (acts.float() @ direction.float()).cpu()
-        for i in range(len(batch)):
-            fractions.append(absorption_fraction(proj[i], act_proj[i].item(), cos, main_feats))
-            full.append(is_full_absorption(proj[i], act_proj[i].item(), cos, latents[i], main_feats))
-    return fractions, full
-
-
-def load_gpt2(device: str):
-    from transformer_lens import HookedTransformer
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    # Hand TransformerLens a built HF model so it never forwards the deprecated torch_dtype.
-    return HookedTransformer.from_pretrained_no_processing(
-        "gpt2",
-        hf_model=AutoModelForCausalLM.from_pretrained("gpt2", dtype=torch.float32),
-        tokenizer=AutoTokenizer.from_pretrained("gpt2"),
-        device=device,
-        dtype=torch.float32,
-    )
-
-
-def load_sae(sae_dir: Path, device: str):
-    with warnings.catch_warnings():
-        # SAE-Lens advises loading the LLM with cfg.model_from_pretrained_kwargs; load_gpt2 does.
-        warnings.filterwarnings(
-            "ignore", r"\s*This SAE has non-empty model_from_pretrained_kwargs", UserWarning
-        )
-        return load_adapter(sae_dir, device)
-
-
-def run(sae_dir: Path, device: str, batch_size: int, seed: int, raw_scale: bool) -> dict:
+def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    if raw_scale:
-        patch_adapter_encode_to_raw_scale()
-    sae = load_sae(sae_dir, device)
-    # Read activations at the hook the SAE was trained on; SAEBench hardcodes hook_resid_post.
-    hook = sae.cfg.hook_name
-    probe_dir = PROBES_DIR / "gpt2" / f"layer_{int(hook.split('.')[1])}"
 
-    model = load_gpt2(device)
-    probe = load_ground_truth_probe(probe_dir, device)
-    train_acts, _, train_labels = load_split(probe_dir, "train", model.tokenizer, device)
-    test_acts, test_words, test_labels = load_split(probe_dir, "test", model.tokenizer, device)
+def prep_dir(evaluation: str, config_name: str) -> Path:
+    return paths.RESULTS / "absorption" / evaluation / config_name / "prep"
 
-    train_latents = encode_all(sae, train_acts)
-    l1_weights = train_l1_probe(train_latents, train_labels)
-    k_probes = train_k_sparse_probes(l1_weights, train_latents.cpu().numpy(), train_labels)
-    del train_acts, train_latents
 
+def probe_dir(config: dict) -> Path:
+    layer = int(config["hook_name"].split(".")[1])
+    return paths.DATA / "absorption" / "probes" / config["model_name"].split("/")[-1] / f"layer_{layer}"
+
+
+@torch.no_grad()
+def build_probe_data(model, config: dict, directory: Path) -> None:
+    hook = config["hook_name"]
+    arrays = {}
+    for split in ("train", "test"):
+        frame = pd.read_csv(directory / f"{split}_df.csv", keep_default_na=False, na_values=[""])
+        prompts = frame["prompt"].tolist()
+        activations = np.empty((len(prompts), model.cfg.d_model), dtype=np.float32)
+        for start in range(0, len(prompts), PROBE_SET_BATCH):
+            cache = model.run_with_cache(prompts[start:start + PROBE_SET_BATCH], names_filter=[hook])[1]
+            activations[start:start + PROBE_SET_BATCH] = cache[hook][:, WORD_POSITION, :].float().cpu().numpy()
+        arrays[f"X_{split}"], arrays[f"y_{split}"] = activations, frame["answer_class"].to_numpy(dtype=np.int64)
+    np.savez_compressed(directory / "data.npz", **arrays)
+
+
+def load_probe_split(tokenizer, directory: Path, split: str) -> tuple[torch.Tensor, list]:
+    data = np.load(directory / "data.npz")
+    frame = pd.read_csv(directory / f"{split}_df.csv", keep_default_na=False, na_values=[""])
+    activations = torch.from_numpy(data[f"X_{split}"]).to("cpu", dtype=torch.bfloat16)
+    rows, words = [], []
+    for row, letter in enumerate(data[f"y_{split}"].tolist()):
+        token = frame.iloc[row]["token"]
+        if not isinstance(token, str) or re.match(r"[\d<>]", token):  # digits and byte tokens such as <0x6A>
+            continue
+        words.append((tokenizer.convert_tokens_to_string([token]), letter))
+        rows.append(row)
+    return activations[rows].clone(), words
+
+
+def letter_prompts(model, config_name: str, seed: int, positives: dict) -> tuple[list, list, list]:
+    words = [word for letter in LETTERS for word in positives[letter]]
+    letters = [index for index, letter in enumerate(LETTERS) for _ in positives[letter]]
+    # SAEBench draws the in-context examples from a set whose order changes between processes, so they are shipped
+    shipped_file = paths.DATA / "absorption" / "prompts" / f"{config_name}.json.gz"
+    shipped = json.loads(gzip.open(shipped_file).read()) if shipped_file.exists() else {"prompts": {}}
+    if str(seed) in shipped["prompts"]:
+        assert shipped["word"] == words and shipped["letter"] == letters, "shipped prompts do not match this probe set"
+        return words, letters, shipped["prompts"][str(seed)]
+    seed_everything(seed)
+    vocabulary, formatter = sorted(get_alpha_tokens(model.tokenizer)), first_letter_formatter()
+    prompts = [create_icl_prompt(word, examples=vocabulary, base_template=PROMPT_TEMPLATE, answer_formatter=formatter,
+                                 example_separator="\n", max_icl_examples=10, shuffle_examples=True,
+                                 prepend_separator_to_first_example=True).base for word in words]
+    return words, letters, prompts
+
+
+def same_length_mask(letters: torch.Tensor, lengths: list[int]) -> torch.Tensor:
+    # the word sits at WORD_POSITION only in the prompts of the most common length of its letter
+    keep = torch.zeros(len(lengths), dtype=torch.bool)
+    for letter in range(len(LETTERS)):
+        rows = (letters == letter).nonzero().flatten().tolist()
+        if rows:
+            most_common = Counter(lengths[i] for i in rows).most_common(1)[0][0]
+            for i in rows:
+                keep[i] = lengths[i] == most_common
+    return keep
+
+
+@torch.no_grad()
+def word_activations(model, prompts: list[str], lengths: list[int], hook: str, dtype) -> torch.Tensor:
+    activations = torch.zeros(len(prompts), model.cfg.d_model, dtype=dtype)
+    rows_by_length = {}
+    for row, length in enumerate(lengths):
+        rows_by_length.setdefault(length, []).append(row)
+    for length, rows in rows_by_length.items():
+        for start in range(0, len(rows), PROMPT_BATCH):
+            batch = rows[start:start + PROMPT_BATCH]
+            tokens = model.to_tokens([prompts[i] for i in batch])
+            assert tokens.shape[1] == length
+            cache = model.run_with_cache(tokens, names_filter=[hook])[1]
+            activations[batch] = cache[hook][:, WORD_POSITION, :].to("cpu", dtype)
+    return activations
+
+
+def prep_letters(config_name: str, seeds: list[int]) -> None:
+    config = load_config(config_name)
+    out = prep_dir("letters", config_name)
+    out.mkdir(parents=True, exist_ok=True)
+    probes = probe_dir(config)
+    llm_dtype = getattr(torch, config["dtype"])
+    model = HookedTransformer.from_pretrained_no_processing(config["model_name"], device="cuda", dtype=llm_dtype)
+    if not (probes / "data.npz").exists():
+        build_probe_data(model, config, probes)
+    probe = torch.load(probes / "probe.pth", map_location="cuda", weights_only=False).to(dtype=torch.bfloat16)
+    train_x, train_words = load_probe_split(model.tokenizer, probes, "train")
+    test_x, test_words = load_probe_split(model.tokenizer, probes, "test")
     with torch.no_grad():
-        test_latents = encode_all(sae, test_acts).cpu().numpy()
-        probe_scores = probe(test_acts).cpu().numpy()
-    rows = letter_metrics(k_probes, test_latents, test_labels, probe_scores)
-    del test_acts, test_latents
+        scores = torch.cat([probe(test_x[i:i + PROBE_EVAL_BATCH].cuda()).float().cpu()
+                            for i in range(0, len(test_x), PROBE_EVAL_BATCH)])
+    test_letters = np.array([letter for _, letter in test_words])
+    test_tokens = [word for word, _ in test_words]
+    f1, positives = {}, {}
+    for index, letter in enumerate(LETTERS):
+        is_letter, predicted = test_letters == index, scores[:, index].numpy() > 0.0
+        f1[letter] = float(metrics.f1_score(is_letter, predicted))
+        positives[letter] = [test_tokens[i] for i in np.where(is_letter & predicted)[0]]
+    eligible = [letter for letter in LETTERS if f1[letter] > MIN_PROBE_F1]
+    assert len(eligible) >= MIN_ELIGIBLE, "SAEBench would refuse this model and layer"
+    torch.save({"concepts": list(LETTERS), "n_classes": len(LETTERS), "train_x": train_x,
+                "train_y": torch.tensor([letter for _, letter in train_words]), "test_x": test_x,
+                "test_y": torch.tensor(test_letters), "probe_weights": probe.weights.detach().float().cpu(),
+                "eligible": eligible}, out / "probe_data.pt")
+    for seed in seeds:
+        word_file = out / f"words_seed{seed}.pt"
+        if word_file.exists():
+            continue
+        _, letter_indices, prompts = letter_prompts(model, config_name, seed, positives)
+        lengths = [len(model.to_tokens(prompt)[0]) for prompt in prompts]
+        letters = torch.tensor(letter_indices)
+        scored = same_length_mask(letters, lengths)
+        if config["model_name"] == "gpt2":
+            assert bool(scored.all()), "GPT-2 prompts must all have one length"
+        activations = word_activations(model, prompts, lengths, config["hook_name"], llm_dtype)
+        torch.save({"activations": activations, "concept": letters, "scored": scored}, word_file)
 
-    usable = [row for row in rows if row["f1_probe"] > MIN_GT_PROBE_F1]
-    if len(usable) < MIN_FEATS_FOR_EVAL:
-        raise SystemExit(
-            f"only {len(usable)} letters reach ground-truth probe F1 > {MIN_GT_PROBE_F1}; "
-            f"the eval needs {MIN_FEATS_FOR_EVAL}. Check artifacts/absorption/probes."
-        )
 
-    vocab = get_alpha_tokens(model.tokenizer)
-    fraction_scores, full_scores, split_counts, details = [], [], [], []
-    for row in usable:
-        letter_i = LETTERS.index(row["letter"])
-        # the probe's true positives: words the ground-truth probe fires on
-        hits = (test_labels == letter_i) & (probe_scores[:, letter_i] > 0)
-        words = [word for word, hit in zip(test_words, hits) if hit]
-        fractions, full = score_letter(
-            model, sae, hook, probe.weights[letter_i], row["split_feats"],
-            words, vocab, batch_size,
-        )
-        fraction_scores.append(sum(fractions) / len(words))
-        full_scores.append(sum(full) / len(words))
-        split_counts.append(len(row["split_feats"]))
-        details.append({
-            "letter": row["letter"],
-            "f1_probe": row["f1_probe"],
-            "mean_absorption_fraction": fraction_scores[-1],
-            "full_absorption_rate": full_scores[-1],
-            "num_probe_true_positives": len(words),
-            "num_split_features": split_counts[-1],
-        })
+def half_split(labels: list[str]) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(0)
+    rows_by_label = {}
+    for row, label in enumerate(labels):
+        rows_by_label.setdefault(label, []).append(row)
+    train = torch.zeros(len(labels), dtype=torch.bool)
+    for rows in rows_by_label.values():
+        chosen = torch.randperm(len(rows), generator=generator)[: len(rows) // 2]
+        train[torch.tensor(rows)[chosen]] = True
+    return train
 
-    return {
-        "mean_absorption_fraction_score": statistics.mean(fraction_scores),
-        "mean_full_absorption_score": statistics.mean(full_scores),
-        "mean_num_split_features": statistics.mean(split_counts),
-        "std_dev_absorption_fraction_score": statistics.stdev(fraction_scores),
-        "letters": details,
-    }
+
+def prep_families(config_name: str, seeds: list[int]) -> None:
+    out = prep_dir("families", config_name)
+    out.mkdir(parents=True, exist_ok=True)
+    states_file, background_file = family_state_files(config_name)
+    collected = torch.load(states_file, map_location="cpu", weights_only=False)
+    states, members = collected["states"], collected["members"]
+    background = torch.load(background_file, map_location="cpu", weights_only=False)[:N_BACKGROUND].float()
+    concepts = list(members)
+    activations, classes, labels = [], [], []
+    for index, concept in enumerate(concepts):
+        for member_index, member in enumerate(members[concept]):
+            occurrences = states.get((concept, member_index), [])
+            if len(occurrences):
+                activations.append(torch.stack(list(occurrences)).float())
+                classes += [index] * len(occurrences)
+                labels += [f"{concept}:{member}"] * len(occurrences)
+    activations = torch.cat(activations + [background])
+    classes = torch.tensor(classes + [len(concepts)] * len(background))
+    labels = labels + ["background"] * len(background)
+    train = half_split(labels)
+    test = ~train
+    seed_everything(0)
+    targets = torch.nn.functional.one_hot(classes[train], num_classes=len(concepts) + 1)[:, : len(concepts)]
+    probe = train_multi_probe(activations[train].cuda(), targets, num_probes=len(concepts), batch_size=64,
+                              num_epochs=50, lr=1e-2, weight_decay=1e-4, show_progress=False,
+                              device=torch.device("cuda"))
+    with torch.no_grad():
+        scores = probe(activations[test].cuda()).float().cpu()
+    test_classes = classes[test].numpy()
+    f1, positives = {}, {}
+    for index, concept in enumerate(concepts):
+        is_concept, predicted = test_classes == index, scores[:, index].numpy() > 0.0
+        f1[concept] = float(metrics.f1_score(is_concept, predicted))
+        positives[concept] = np.where(is_concept & predicted)[0].tolist()
+    eligible = [concept for concept in concepts if f1[concept] > MIN_PROBE_F1]
+    test_x = activations[test]
+    torch.save({"concepts": concepts, "n_classes": len(concepts) + 1, "train_x": activations[train],
+                "train_y": classes[train], "test_x": test_x, "test_y": classes[test],
+                "probe_weights": probe.weights.detach().float().cpu(), "eligible": eligible}, out / "probe_data.pt")
+    rows = [i for concept in concepts for i in positives[concept]]
+    words = {"activations": test_x[rows],
+             "concept": torch.tensor([index for index, concept in enumerate(concepts) for _ in positives[concept]]),
+             "scored": torch.ones(len(rows), dtype=torch.bool)}
+    for seed in seeds:
+        torch.save(words, out / f"words_seed{seed}.pt")
+
+
+class Dictionary:
+    # codes in activation units (times the decoder-row norm, and the layer-norm scale of SASA's input) on unit-norm
+    # decoder rows, read in units of unit_size consecutive columns: a latent, or a SASA group for concept families
+    def __init__(self, sae, evaluation: str, threshold: float | None = None):
+        self.sae, self.threshold = sae, threshold
+        self.engels = isinstance(sae, EngelsReLU)
+        self.unit_size = getattr(sae, "group_rank", 1) if evaluation == "families" else 1
+        decoder = sae.W_dec.detach().float()
+        self.n_columns, self.d_in = decoder.shape
+        self.decoder_norms = decoder.norm(dim=-1)
+        self.directions = decoder / self.decoder_norms[:, None]
+        self.layer_norm = getattr(sae.cfg, "normalize_activations", None) == "layer_norm"
+        self.n_units = self.n_columns // self.unit_size
+        unit_directions = self.directions.reshape(self.n_units, self.unit_size, self.d_in)
+        self.unit_gram = unit_directions @ unit_directions.transpose(-1, -2)
+        if self.unit_size > 1:
+            # a unit's output in orthonormal coordinates, V_u^T y_u with V_u the right singular vectors of its decoder
+            right_singular = torch.linalg.svd(decoder.reshape(self.n_units, self.unit_size, self.d_in).double(),
+                                              full_matrices=False)[2]
+            self.output_map = (unit_directions.double() @ right_singular.transpose(-1, -2)).transpose(-1, -2).float()
+        self.signs = None
+
+    @torch.no_grad()
+    def codes(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        if self.threshold is not None:  # BatchTopK-trained SASA: the groups above the inference threshold
+            pre_acts = self.sae.process_sae_in(x) @ self.sae.W_enc + self.sae.b_enc
+            groups = pre_acts.view(-1, self.sae.n_groups, self.sae.group_rank)
+            codes = (groups * (groups.norm(dim=-1, keepdim=True) > self.threshold)).reshape(x.shape[0], -1)
+        else:
+            codes = self.sae.encode(x).float()
+        if self.engels:
+            return codes * (self.sae.decoder_norms.float()[None, :] / self.sae.input_scale.reshape(-1, 1).float())
+        scale = self.decoder_norms[None, :]
+        if self.layer_norm:
+            scale = scale * self.sae.ln_std.reshape(-1, 1).float()
+        return codes * scale
+
+    def units(self, columns: torch.Tensor) -> torch.Tensor:
+        return columns.reshape(columns.shape[0], self.n_units, self.unit_size)
+
+    def orient(self, train_codes: torch.Tensor) -> None:
+        mean = torch.zeros(self.n_units, self.unit_size, device=self.output_map.device)
+        for start in range(0, train_codes.shape[0], CODE_BATCH):
+            mean += self.units(train_codes[start:start + CODE_BATCH].cuda()).sum(0)
+        mean /= train_codes.shape[0]
+        self.signs = torch.where(torch.einsum("uij,uj->ui", self.output_map, mean) < 0, -1.0, 1.0)
+
+    def unit_coordinates(self, codes: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(codes.shape[0], self.n_columns, dtype=torch.float32)
+        for start in range(0, codes.shape[0], CODE_BATCH):
+            batch = codes[start:start + CODE_BATCH].cuda()
+            coordinates = torch.einsum("uij,nuj->nui", self.output_map, self.units(batch)) * self.signs[None]
+            out[start:start + CODE_BATCH] = coordinates.reshape(batch.shape[0], -1).cpu()
+        return out
+
+
+def encode_all(dictionary: Dictionary, activations: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(len(activations), dictionary.n_columns, dtype=torch.float32)
+    for start in range(0, len(activations), CODE_BATCH):
+        out[start:start + CODE_BATCH] = dictionary.codes(activations[start:start + CODE_BATCH].cuda()).cpu()
+    return out
+
+
+def sparsity_penalty(unit_size: int, n_probes: int):
+    def penalty(probe, _activations, _labels):
+        if unit_size == 1:
+            return SPARSE_PROBE_L1 * probe.weights.abs().sum(dim=-1).mean()
+        return SPARSE_PROBE_L1 * probe.weights.reshape(n_probes, -1, unit_size).norm(dim=-1).sum(dim=-1).mean()
+    return penalty
+
+
+def train_sparse_probe(codes, labels, unit_size: int, seed: int, n_probes: int, n_classes: int) -> torch.Tensor:
+    seed_everything(seed)
+    targets = torch.nn.functional.one_hot(labels, num_classes=n_classes)[:, :n_probes]
+    probe = train_multi_probe(codes, targets, num_probes=n_probes, batch_size=4096, num_epochs=50, lr=0.01, end_lr=1e-5,
+                              weight_decay=1e-6, show_progress=False, verbose=False, device=torch.device("cuda"),
+                              extra_loss_fn=sparsity_penalty(unit_size, n_probes), map_acts=None,
+                              probe_dim=codes.shape[1])
+    return probe.weights.detach().float()
+
+
+def select_main_units(train_codes, train_labels, test_codes, test_labels, probe_weights, unit_size: int,
+                      eligible: list, concepts) -> dict:
+    n_units = probe_weights.shape[1] // unit_size
+    selection = {}
+    for concept in eligible:
+        index = list(concepts).index(concept)
+        weights = probe_weights[index]
+        if unit_size == 1:
+            unit_scores = weights
+        else:
+            positive_sum = train_codes[(train_labels == index).to(train_codes.device)].sum(0).to(weights.device)
+            alignment = (weights * positive_sum).reshape(n_units, unit_size).sum(-1)
+            unit_scores = weights.reshape(n_units, unit_size).norm(dim=-1) * torch.sign(alignment)
+        train_target = (train_labels == index).numpy().astype(np.int64)
+        test_target = (test_labels == index).numpy()
+        f1_by_k, units_by_k = [], []
+        for k in range(1, MAX_MAIN_UNITS + 1):
+            units = unit_scores.topk(k).indices
+            columns = (units[:, None] * unit_size + torch.arange(unit_size, device=units.device)[None]).flatten()
+            columns = columns.to(train_codes.device)
+            regression = LogisticRegression(max_iter=500, class_weight="balanced")
+            regression.fit(train_codes[:, columns].float().cpu().numpy(), train_target)
+            scores = (test_codes[:, columns.to(test_codes.device)].float().cpu().numpy() @ regression.coef_[0]
+                      + regression.intercept_[0])
+            f1_by_k.append(float(metrics.f1_score(test_target, scores > 0.0)))
+            units_by_k.append(units.cpu().tolist())
+        best_f1, main_units = -100.0, []
+        for f1, units in zip(f1_by_k, units_by_k):
+            if not f1 > best_f1 + F1_GAIN:
+                break
+            best_f1, main_units = f1, units
+        selection[concept] = main_units
+    return selection
+
+
+def word_absorption(contributions, cosines, silent, projection, main_units) -> tuple[torch.Tensor, torch.Tensor]:
+    n_words, n_units = contributions.shape
+    is_main = torch.zeros(n_units, dtype=torch.bool, device=contributions.device)
+    is_main[main_units] = True
+    main = contributions[:, is_main].sum(1)
+    candidates = (~is_main)[None, :] & (cosines >= ABSORBER_COSINE) & (contributions > 0)
+    top = torch.where(candidates, contributions, torch.full_like(contributions, -float("inf")))
+    top = top.topk(N_ABSORBERS, dim=1).values
+    absorbed = torch.where(torch.isfinite(top), top, torch.zeros_like(top)).sum(1)
+    no_absorption = (main >= projection) | (absorbed / projection < ABSORBED_SHARE)
+    main_not_positive = ~no_absorption & (main <= 0.0)
+    partial = ~no_absorption & ~main_not_positive
+    fraction = torch.zeros(n_words, dtype=torch.float64, device=contributions.device)
+    fraction[main_not_positive] = 1.0
+    capped = torch.minimum(absorbed, projection - main)
+    fraction[partial] = (capped / (capped + main)).clamp(0.0, 1.0)[partial].double()
+    strongest = contributions.argmax(1, keepdim=True)
+    strongest_contribution = contributions.gather(1, strongest).squeeze(1)
+    strongest_cosine = cosines.gather(1, strongest).squeeze(1)
+    full = (silent[:, is_main].all(1) & (strongest_cosine >= FULL_ABSORBER_COSINE) & (projection >= 0)
+            & (strongest_contribution / projection >= ABSORBED_SHARE))
+    return fraction, full
+
+
+def latent_absorption(dictionary: Dictionary, activations, projection, direction, main_units) -> tuple:
+    codes = dictionary.codes(activations)
+    cosines = dictionary.directions @ direction
+    contributions = codes * cosines[None, :]
+    return word_absorption(contributions, cosines[None, :].expand_as(contributions), codes < SILENT, projection,
+                           main_units)
+
+
+def unit_absorption(dictionary: Dictionary, activations, projection, direction, main_units) -> tuple:
+    # a group contributes its output y_u = sum_j c_j d_j projected on the probe, with the cosine of y_u
+    codes = dictionary.codes(activations)
+    cosines = dictionary.directions @ direction
+    unit_codes = dictionary.units(codes)
+    contributions = dictionary.units(codes * cosines[None, :]).sum(-1)
+    output_norms = torch.einsum("nur,urs,nus->nu", unit_codes, dictionary.unit_gram, unit_codes).clamp(min=0).sqrt()
+    unit_cosines = torch.where(output_norms > 0, contributions / output_norms.clamp(min=1e-30),
+                               torch.zeros_like(contributions))
+    return word_absorption(contributions, unit_cosines, output_norms < SILENT, projection, main_units)
+
+
+def score_dictionary(evaluation: str, name: str, dictionary: Dictionary, probe_data: dict, word_files: dict,
+                     seeds: list[int], out: Path) -> None:
+    concepts, eligible = probe_data["concepts"], probe_data["eligible"]
+    n_probes, n_classes = len(concepts), probe_data["n_classes"]
+    probe_weights = probe_data["probe_weights"]
+    probe_directions = (probe_weights / probe_weights.norm(dim=-1, keepdim=True)).cuda()
+    train_codes = encode_all(dictionary, probe_data["train_x"])
+    test_codes = encode_all(dictionary, probe_data["test_x"])
+    train_labels, test_labels = probe_data["train_y"], probe_data["test_y"]
+    if dictionary.unit_size > 1:
+        dictionary.orient(train_codes)
+        train_codes, test_codes = dictionary.unit_coordinates(train_codes), dictionary.unit_coordinates(test_codes)
+    absorption = latent_absorption if evaluation == "letters" else unit_absorption
+    out.mkdir(parents=True, exist_ok=True)
+    for seed in seeds:
+        probe = train_sparse_probe(train_codes, train_labels, dictionary.unit_size, seed, n_probes, n_classes)
+        selection = select_main_units(train_codes, train_labels, test_codes, test_labels, probe, dictionary.unit_size,
+                                      eligible, concepts)
+        words = word_files[seed]
+        mean, full = [], []
+        for concept in eligible:
+            index = concepts.index(concept)
+            rows = ((words["concept"] == index) & words["scored"]).nonzero().flatten()
+            activations = words["activations"][rows].cuda().float()
+            direction = probe_directions[index]
+            fraction, fully_absorbed = absorption(dictionary, activations, activations @ direction, direction,
+                                                  selection[concept])
+            mean.append(float(fraction.sum()) / max(len(rows), 1))
+            full.append(float(fully_absorbed.sum()) / max(len(rows), 1))
+        record = {"sae": name, "seed": seed, "evaluation": evaluation, "mean_absorption": float(np.mean(mean)),
+                  "full_absorption": float(np.mean(full))}
+        (out / f"seed{seed}.json").write_text(json.dumps(record, indent=1))
+
+
+def score(evaluation: str, names: list[str], seeds: list[int]) -> None:
+    config_name = names[0].split("/")[0]
+    assert all(name.split("/")[0] == config_name for name in names), "SAEs of one config per run"
+    prep = prep_dir(evaluation, config_name)
+    probe_data = torch.load(prep / "probe_data.pt", weights_only=False)
+    word_files = {seed: torch.load(prep / f"words_seed{seed}.pt", weights_only=False) for seed in seeds}
+    for name in names:
+        out = paths.RESULTS / "absorption" / evaluation / name
+        todo = [seed for seed in seeds if not (out / f"seed{seed}.json").exists()]
+        if not todo:
+            continue
+        torch.cuda.empty_cache()
+        sae = load_sae(name)
+        threshold = None
+        if getattr(sae.cfg, "gate", None) == "batchtopk":
+            threshold = gate_threshold(name)
+            if threshold is None:
+                raise SystemExit(f"{name}: calibrate the inference threshold first (python -m eval.gate {name})")
+        dictionary = Dictionary(sae, evaluation, threshold)
+        score_dictionary(evaluation, name, dictionary, probe_data, word_files, todo, out)
+        del sae, dictionary
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--sae", required=True,
-                    help="Checkpoint directory name (under SASA_CHECKPOINTS) or an absolute path.")
-    ap.add_argument("--label", required=True, help="Output label; must be unique per run.")
-    ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--batch-size", type=int, default=16)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--no-raw-scale", action="store_true",
-                    help="Skip the layer-norm rescaling, i.e. score layer_norm SAEs in their "
-                         "own units rather than raw activation units.")
-    args = ap.parse_args()
+    def seed_list(text):
+        return [int(seed) for seed in text.split(",")]
 
-    adapter_mod._set_hf_cache_defaults(REPO_ROOT)
-    sae_dir = Path(args.sae) if Path(args.sae).is_absolute() else CHECKPOINTS / args.sae
-    result = run(sae_dir, args.device, args.batch_size, args.seed, not args.no_raw_scale)
-    result = {"label": args.label, "sae": str(sae_dir), "seed": args.seed, **result}
-
-    out_dir = REPORT_DIR / args.label
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "summary.json").write_text(json.dumps(result, indent=2))
-    print(json.dumps({k: v for k, v in result.items() if k != "letters"}, indent=2))
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    prep = commands.add_parser("prep", help="probe and word activations of a config, shared by its SAEs")
+    prep.add_argument("evaluation", choices=("letters", "families"))
+    prep.add_argument("config", help="gpt2_l7 or mistral_l8 (first letters), gpt2_l7 (concept families)")
+    prep.add_argument("--seeds", type=seed_list, default=[0, 1, 2])
+    scoring = commands.add_parser("score", help="absorption of SAEs, one result file per seed")
+    scoring.add_argument("evaluation", choices=("letters", "families"))
+    scoring.add_argument("saes", nargs="+", help="<config>/<sae> ...")
+    scoring.add_argument("--seeds", type=seed_list, default=[0, 1, 2])
+    args = parser.parse_args()
+    if args.command == "prep":
+        (prep_letters if args.evaluation == "letters" else prep_families)(args.config, args.seeds)
+    else:
+        score(args.evaluation, args.saes, args.seeds)
 
 
 if __name__ == "__main__":

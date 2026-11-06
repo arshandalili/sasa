@@ -1,0 +1,139 @@
+# GPT-2 small, residual stream entering block 7. columns = decoder columns, l0 = active columns per token.
+model_name: gpt2
+hook_name: blocks.7.hook_resid_pre
+d_in: 768
+dataset_path: apollo-research/Skylion007-openwebtext-tokenizer-gpt2
+is_dataset_tokenized: true
+context_size: 128
+train_batch_size_tokens: 4096
+training_tokens: 300000000
+seed: 42
+dtype: float32
+activation_cache: gpt2_l7_300m
+adam_beta1: 0.9
+adam_beta2: 0.999
+lr_decay_fraction: 0.2
+dead_feature_window: 1000
+store_batch_size_prompts: 16
+
+# training settings shared by the SAEs of each method
+methods:
+  # SASA of the matched grid
+  sasa:
+    architecture: topk_sasa
+    gate: topk
+    lr: 4.0e-4
+    lr_warm_up_steps: 1000
+    n_batches_in_buffer: 128
+    normalize_activations: layer_norm
+    apply_b_dec_to_input: false
+    encoder_norm_renorm: false
+    k_aux: 384
+    aux_coefficient: 1.0
+    dead_feature_window: 100
+    nuclear_coefficient: 0.0
+    nuclear_target: composition
+    n_checkpoints: 2
+  # SASA compared with Bloom's pretrained GPT-2 SAE
+  sasa_topk:
+    architecture: topk_sasa
+    gate: topk
+    lr: 2.0e-4
+    lr_warm_up_steps: 1000
+    n_batches_in_buffer: 128
+    training_tokens: 150000000
+    normalize_activations: layer_norm
+    apply_b_dec_to_input: true
+    encoder_norm_renorm: true
+    k_aux: 384
+    aux_coefficient: 1.0
+    nuclear_coefficient: 100.0
+    nuclear_target: decoder
+    n_checkpoints: 0
+  # vector baselines
+  topk:
+    architecture: topk
+    lr: 4.0e-4
+    lr_warm_up_steps: 0
+    n_batches_in_buffer: 64
+    normalize_activations: none
+    apply_b_dec_to_input: true
+    aux_loss_coefficient: 1.0
+    rescale_acts_by_decoder_norm: true
+    n_checkpoints: 1
+  batchtopk:
+    architecture: batchtopk
+    lr: 4.0e-4
+    lr_warm_up_steps: 0
+    n_batches_in_buffer: 64
+    normalize_activations: none
+    apply_b_dec_to_input: true
+    aux_loss_coefficient: 1.0
+    rescale_acts_by_decoder_norm: true
+    topk_threshold_lr: 0.01
+    n_checkpoints: 1
+  matryoshka:
+    architecture: matryoshka_batchtopk
+    lr: 4.0e-4
+    lr_warm_up_steps: 0
+    n_batches_in_buffer: 64
+    normalize_activations: none
+    apply_b_dec_to_input: true
+    aux_loss_coefficient: 1.0
+    rescale_acts_by_decoder_norm: true
+    topk_threshold_lr: 0.01
+    n_checkpoints: 1
+
+saes:
+  sasa_r2_l030_w12288: {method: sasa, rank: 2, columns: 12288, l0: 30}
+  sasa_r2_l060_w12288: {method: sasa, rank: 2, columns: 12288, l0: 60}
+  sasa_r2_l0120_w12288: {method: sasa, rank: 2, columns: 12288, l0: 120}
+  sasa_r2_l0240_w12288: {method: sasa, rank: 2, columns: 12288, l0: 240}
+  sasa_r2_l0120_w24576: {method: sasa, rank: 2, columns: 24576, l0: 120}
+  sasa_r2_l0120_w49152: {method: sasa, rank: 2, columns: 49152, l0: 120}
+  sasa_r4_l060_w12288: {method: sasa, rank: 4, columns: 12288, l0: 60}
+  sasa_r4_l0120_w12288: {method: sasa, rank: 4, columns: 12288, l0: 120}
+  sasa_r4_l0240_w12288: {method: sasa, rank: 4, columns: 12288, l0: 240}
+  sasa_r6_l030_w12288: {method: sasa, rank: 6, columns: 12288, l0: 30}
+  sasa_r6_l060_w12288: {method: sasa, rank: 6, columns: 12288, l0: 60}
+  sasa_r6_l0120_w12288: {method: sasa, rank: 6, columns: 12288, l0: 120}
+  sasa_r6_l0240_w12288: {method: sasa, rank: 6, columns: 12288, l0: 240}
+  sasa_r6_l060_w24576: {method: sasa, rank: 6, columns: 24576, l0: 60}
+  sasa_r6_l0120_w24576: {method: sasa, rank: 6, columns: 24576, l0: 120}
+  sasa_r6_l0240_w24576: {method: sasa, rank: 6, columns: 24576, l0: 240}
+  sasa_r6_l060_w49152: {method: sasa, rank: 6, columns: 49152, l0: 60}
+  sasa_r6_l0120_w49152: {method: sasa, rank: 6, columns: 49152, l0: 120}
+  sasa_r6_l0240_w49152: {method: sasa, rank: 6, columns: 49152, l0: 240}
+  sasa_r8_l0120_w12288: {method: sasa, rank: 8, columns: 12288, l0: 120}
+  sasa_r8_l0240_w12288: {method: sasa, rank: 8, columns: 12288, l0: 240}
+  sasa_topk_r6_l060_w12288: {method: sasa_topk, rank: 6, columns: 12288, l0: 60}
+  topk_l030_w12288: {method: topk, columns: 12288, l0: 30}
+  topk_l060_w12288: {method: topk, columns: 12288, l0: 60}
+  topk_l0120_w12288: {method: topk, columns: 12288, l0: 120}
+  topk_l0240_w12288: {method: topk, columns: 12288, l0: 240}
+  topk_l060_w24576: {method: topk, columns: 24576, l0: 60}
+  topk_l0120_w24576: {method: topk, columns: 24576, l0: 120}
+  topk_l0240_w24576: {method: topk, columns: 24576, l0: 240}
+  topk_l060_w49152: {method: topk, columns: 49152, l0: 60}
+  topk_l0120_w49152: {method: topk, columns: 49152, l0: 120}
+  topk_l0240_w49152: {method: topk, columns: 49152, l0: 240}
+  batchtopk_l030_w12288: {method: batchtopk, columns: 12288, l0: 30}
+  batchtopk_l060_w12288: {method: batchtopk, columns: 12288, l0: 60}
+  batchtopk_l0120_w12288: {method: batchtopk, columns: 12288, l0: 120}
+  batchtopk_l0240_w12288: {method: batchtopk, columns: 12288, l0: 240}
+  batchtopk_l060_w24576: {method: batchtopk, columns: 24576, l0: 60}
+  batchtopk_l0120_w24576: {method: batchtopk, columns: 24576, l0: 120}
+  batchtopk_l0240_w24576: {method: batchtopk, columns: 24576, l0: 240}
+  batchtopk_l060_w49152: {method: batchtopk, columns: 49152, l0: 60}
+  batchtopk_l0120_w49152: {method: batchtopk, columns: 49152, l0: 120}
+  batchtopk_l0240_w49152: {method: batchtopk, columns: 49152, l0: 240}
+  matryoshka_l030_w12288: {method: matryoshka, columns: 12288, l0: 30}
+  matryoshka_l060_w12288: {method: matryoshka, columns: 12288, l0: 60}
+  matryoshka_l0120_w12288: {method: matryoshka, columns: 12288, l0: 120}
+  matryoshka_l0240_w12288: {method: matryoshka, columns: 12288, l0: 240}
+  matryoshka_l060_w24576: {method: matryoshka, columns: 24576, l0: 60}
+  matryoshka_l0120_w24576: {method: matryoshka, columns: 24576, l0: 120}
+  matryoshka_l0240_w24576: {method: matryoshka, columns: 24576, l0: 240}
+  matryoshka_l060_w49152: {method: matryoshka, columns: 49152, l0: 60}
+  matryoshka_l0120_w49152: {method: matryoshka, columns: 49152, l0: 120}
+  matryoshka_l0240_w49152: {method: matryoshka, columns: 49152, l0: 240}

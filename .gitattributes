@@ -1,2 +1,0 @@
-checkpoints/*mistral*/*.safetensors filter=lfs diff=lfs merge=lfs -text
-artifacts/**/*.npz filter=lfs diff=lfs merge=lfs -text

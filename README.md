@@ -1,224 +1,253 @@
-# SASA: Subspace-Aware Sparse Autoencoders
+# Subspace-Aware Sparse Autoencoders (SASA)
 
-A standard SAE ties every latent to a single decoder direction, which assumes each feature
-is one-dimensional. Many features in an LLM are not: day of the week, month, year and
-colour are carried by low-dimensional *subspaces*, often with circular structure. The
-mismatch is not benign. Reconstructing a feature of intrinsic dimension `d_i` to error
-`eps` out of single directions takes a number of atoms exponential in `d_i`, and the
-l1-regularized objective descends toward exactly that tiling, so a trained dictionary
-fragments one coherent feature across many near-collinear latents. That is feature
-splitting: reading the feature means aggregating a cluster of latents rather than
-inspecting one unit.
+Code for **Subspace-Aware Sparse Autoencoders for Effective Mechanistic Interpretability**.
 
-SASA makes the decoder *subspace* the unit of representation. Each latent gets a rank-`r`
-decoder block instead of a vector, gating is Top-`s` over the group norms `||p_k(h)||_2`
-so a whole block switches on at once, and a trace-norm penalty on each block lets its
-effective rank adapt to the feature it holds. A model is `(K, r, s)`: `K` groups of rank
-`r`, `s` active per token, so the dictionary has `m = Kr` columns and `l0 = sr`. Once
-`r >= d_i` a single group is the global minimizer of the SASA objective, unique up to
-block index and orthogonal rotation, which turns feature recovery into principal subspace
-estimation and makes the sample complexity polynomial in `d_i` instead of exponential.
+Seyed Arshan Dalili and Mehrdad Mahdavi, NeurIPS 2026
 
-![Vector-based SAEs split a multi-dimensional feature across many near-collinear atoms;
-SASA captures it as one subspace.](assets/figure1.png)
+Standard sparse autoencoders (SAEs) reconstruct language-model activations as sparse combinations of directions.
+When a concept has multidimensional structure, this can split its representation across several SAE features.
+SASA learns a low-dimensional subspace for each feature and activates its directions together, allowing a single
+feature to capture the structure of concepts such as days of the week or months of the year.
 
-Three ground-truth manifolds -- a circle (`d_i=2`), a sphere (`d_i=3`) and a helix
-(`d_i=3`) -- embedded in `d=64` and fit by six dictionaries of width 256. Every
-vector-based SAE spreads a manifold over tens to hundreds of atoms; SASA covers it with
-one group of effective rank `d_i`. `experiments/synthetic_dimension.py` reproduces this.
+This repository includes the [SAELens](https://github.com/jbloomAus/SAELens) implementation, pretrained models for
+GPT-2 and Mistral-7B, and scripts to reproduce the paper's experiments.
+
+<p align="center"><img src="assets/figure1.png" width="780" alt="Visualization of learned SASA features"></p>
+
+[Setup](#setup) · [Pretrained models](#pretrained-models) · [Experiments](#experiments) · [Citation](#citation)
 
 ## Setup
 
 ```bash
+git clone https://github.com/arshandalili/sasa && cd sasa
 uv venv .venv --python 3.10
 source .venv/bin/activate
 uv pip install -r requirements.txt
-
-export SASA_SCRATCH=/path/to/activations
-export SASA_CHECKPOINTS=$PWD/checkpoints
-export SASA_RESULTS=$PWD/results
-export SASA_CACHE_ROOT=$PWD/.cache
 ```
 
-Run everything as a module from this directory.
+Run all commands from the repository root with the environment active. The requirements pin the versions used in
+the paper, including SAELens 6.25 and SAEBench. To use Mistral-7B, follow the access instructions on
+[its model page](https://huggingface.co/mistralai/Mistral-7B-v0.1) and sign in with `hf auth login` or set `HF_TOKEN`.
 
-## Large files
+## Pretrained models
 
-Two files are too big for ordinary git and are stored with Git LFS. If `git-lfs` was not
-installed on the machine when you cloned, they arrive as small text pointers instead of
-real data and the commands that read them fail on a malformed-file error:
-
-```bash
-git lfs install
-git lfs pull
-```
-
-| file | size | needed by |
+| Language model | Activations | Hugging Face release |
 | --- | --- | --- |
-| `artifacts/absorption/probes/gpt2/layer_7/data.npz` | 134 MB | `eval/absorption.py` |
-| `checkpoints/topk_sasa_mistral7b_l19_n8192_r4_k15/sae_weights.safetensors` | 1.1 GB | the causal intervention |
+| GPT-2 small | Before block 7 (`blocks.7.hook_resid_pre`) | [SASA and the TopK, BatchTopK and Matryoshka baselines](https://huggingface.co/arshandalili/sasa-gpt2-layer7) |
+| Mistral-7B-v0.1 | Before block 8 (`blocks.8.hook_resid_pre`) | [SASA](https://huggingface.co/arshandalili/sasa-mistral-7b-layer8) |
 
-Everything else is ordinary git, so the GPT-2 checkpoints and the rest of the commands work without LFS. If you would rather not install it, `python -m scripts.rebuild_probe_activations` regenerates the probe cache from the shipped CSVs in one GPT-2 pass; the Mistral checkpoint has no such fallback and would have to be retrained.
+Import `sasa` to register the model with SAELens, then load a checkpoint. For example, given GPT-2 activations `h`
+with shape `[tokens, 768]` from the location above:
 
-## Cache
+```python
+import sasa  # registers SASA with SAELens
+from sae_lens import SAE
 
-Cache the activation stream once, every model then reads the same tokens in the same order.
-
-**NOTE: THIS COMMAND WILL GENERATE FILES IN ORDER OF 800GB.**
-
-```bash
-python -m scripts.cache_activations \
-  --model-name gpt2 --hook-name blocks.7.hook_resid_pre --d-in 768 \
-  --dataset apollo-research/Skylion007-openwebtext-tokenizer-gpt2 \
-  --context-size 128 --training-tokens 300000000 \
-  --output-path $SASA_SCRATCH/gpt2_l7_300m
+sae = SAE.from_pretrained("arshandalili/sasa-gpt2-layer7", "sasa_r6_l0120_w24576")
+codes = sae.encode(h.to(device=sae.device, dtype=sae.dtype))
+groups = codes.reshape(-1, sae.n_groups, sae.group_rank)  # [tokens, 4096, 6]
+reconstruction = sae.decode(codes)
 ```
 
-## Train
+This checkpoint has 4,096 groups of six directions and activates 20 groups per token. Each group's activation
+strength is `groups.norm(dim=-1)`.
 
-A single GPT-2 SASA model:
+For Mistral, use the checkpoint `sasa_r8_k10` from the Mistral release. Its `encode()` method selects active groups
+across the batch. The paper's evaluations use a calibrated threshold instead; see the
+[model card](https://huggingface.co/arshandalili/sasa-mistral-7b-layer8) for details.
+
+## Experiments
+
+Download the checkpoints, then run the experiments below. The [synthetic experiments](#synthetic-experiments)
+generate their own data and can run directly after [setup](#setup).
+
+### Download the checkpoints
+
+The full GPT-2 release is 7.9 GB; the Mistral release is 1.1 GB.
 
 ```bash
-python -m scripts.train_sasa \
-  --model-name gpt2 --hook-name blocks.7.hook_resid_pre --d-in 768 \
-  --n-groups 2048 --group-rank 6 --k-groups 10 \
-  --dataset apollo-research/Skylion007-openwebtext-tokenizer-gpt2 --tokenized \
-  --training-tokens 300000000 --context-size 128 --save-dir $SASA_CHECKPOINTS
+hf download arshandalili/sasa-gpt2-layer7 --local-dir checkpoints/gpt2_l7
+hf download arshandalili/sasa-mistral-7b-layer8 --local-dir checkpoints/mistral_l8
 ```
 
-`scripts/train_sasa.py` takes any TransformerLens model.
+To download a single model, add `--include "<checkpoint>/*"`, for example `--include "sasa_r6_l0120_w24576/*"`.
 
-The matched-budget sweep. Every arm shares width (12,288 columns), hook, token stream,
-token budget, optimizer, schedule and seed; architecture and sparsity vary.
-These are the sixteen models behind the absorption and explained-variance tables:
+Model names have the form `<config>/<checkpoint>`, such as `gpt2_l7/sasa_r6_l0120_w24576`.
+Run `python -m configs gpt2_l7` to list the available GPT-2 checkpoints. Training settings are in [configs/](configs/).
+
+<details>
+<summary>Optional: train the models from scratch</summary>
+
+GPT-2 training first needs an activation cache: 300M OpenWebText tokens, about 0.9 TB of disk space.
 
 ```bash
-for arch in topk batchtopk matryoshka topk_sasa; do
-  for l0 in 30 60 120 240; do
-    python -m scripts.train_matched_budget --arch $arch --l0 $l0 --use-cached-activations
-  done
-done
+python cache.py gpt2_l7
+python train.py gpt2_l7/sasa_r6_l0120_w24576
 ```
 
-The rank x nuclear-coefficient ablation, all at width 12,288 and `l0=60`:
+Mistral computes activations during training. Calibrate each new model's activation threshold afterward; the
+included threshold is specific to the released weights.
 
 ```bash
-for r in 3 6 12; do for nuc in 0 10 100; do
-  python -m scripts.train_matched_budget --arch topk_sasa --l0 60 \
-    --group-rank $r --nuclear-coefficient $nuc --use-cached-activations
-done; done
+python train.py mistral_l8/sasa_r8_k10
+python -m eval.gate mistral_l8/sasa_r8_k10
 ```
 
-`--arch relu|jumprelu|gated` trains the l1-family baselines (their `l0` follows from the
-sparsity coefficient, so `--l0` is ignored). `--nuclear-coefficient` is `lambda_dim`.
-`metrics/mean_stable_rank` should sit strictly between 1 and `group_rank`.
+</details>
 
-## Evaluate
+### GPT-2
 
-Reconstruction and faithfulness (KL, CE, explained variance, l0), against the pretrained
-GPT-2 SAE `gpt2-small-res-jb` at the same hook:
+The core, absorption and member-prediction examples use `sasa_r6_l0120_w24576`. Replace it or pass additional
+checkpoint names to evaluate other models.
+
+**Reconstruction and model behavior.** Run SAEBench to measure reconstruction quality and how well the SAE
+preserves GPT-2's predictions. Results include cross-entropy (CE) score, KL score and explained variance.
 
 ```bash
-python -m eval.run_core \
-  --topk-sasa-dir checkpoints/topk_sasa_gpt2_l7_r6_nuc100_l060 \
-  --hook blocks.7.hook_resid_pre
+python -m eval.core gpt2_l7/sasa_r6_l0120_w24576
 ```
 
-First-letter feature absorption, scored by `eval/absorption.py`. The ground-truth probes
-and their cached activations ship in `artifacts/absorption/probes/`, so nothing is trained
-here; `scripts/rebuild_probe_activations.py` regenerates the cache from the shipped CSVs
-if you ever need to.
+To compare with the pretrained GPT-2 SAE of Bloom (2024), which SAELens downloads, add `gpt2_l7/jb_relu_w24576`.
+
+**Feature absorption.** Measure how much of a concept's signal is carried by features other than its main detectors.
+Evaluate individual decoder directions for first letters and whole SASA groups for ten concept families, including
+months and colors.
+
+Prepare the shared data. Preparation and scoring both use three seeds (0, 1 and 2) by default.
 
 ```bash
-python -m eval.absorption --sae topk_sasa_gpt2_l7_r6_nuc100_l060 --label sasa_l060
+python -m eval.absorption prep letters gpt2_l7
+python -m eval.member_prediction collect gpt2_l7
+python -m eval.absorption prep families gpt2_l7
 ```
 
-Three scores come out of a run. Absorption fraction is how much of a letter's probe
-direction ends up carried by latents other than the one that should own it. Full absorption
-is the all-or-nothing version, counting only the cases where the owning latent stays silent
-altogether. Split features is how many latents a single letter is spread across.
-
-Absorption fraction is the one to compare architectures on. The other two turn on whether a
-particular unit fired, and at a matched column budget SASA fires `s` groups per token where
-a scalar SAE fires `l0` latents, so they partly measure that difference in gating rather
-than absorption.
-
-The temporal subspace of Figure 3. Group 1473 spans years; the three panels are its
-explained-variance spectrum, the 3D PCA of the year directions, and the circular fit:
+Then evaluate the checkpoint on both benchmarks:
 
 ```bash
-python -m analysis.temporal_subspace \
-  --sae-dir checkpoints/topk_sasa_gpt2_l7_n2048_r6_k10 --group-id 1473
+python -m eval.absorption score letters gpt2_l7/sasa_r6_l0120_w24576
+python -m eval.absorption score families gpt2_l7/sasa_r6_l0120_w24576
 ```
 
-AutoInterp:
+**Member prediction.** Test whether features distinguish family members, such as January from February. This uses
+the data collected above, budgets of 6 or 24 decoder directions, and three train/test splits:
 
 ```bash
-python -m eval.run_autointerp --sae-dir checkpoints/topk_sasa_gpt2_l7_n2048_r6_k10 \
-  --label sasa_l060 --api-key-file openai_key.txt
+python -m eval.member_prediction score gpt2_l7/sasa_r6_l0120_w24576
 ```
 
-For SASA the unit this evaluates is the *group*, whose activation is the group norm
-`||p_k(h)||_2`. A group is charged all `r` of its columns wherever a column budget is
-compared.
+Absorption and member prediction reuse completed results, so you can rerun these commands after an interruption.
 
-Evaluate the final saved model, not a mid-training snapshot: SAE-Lens folds the decoder row
-norms into the encoder on the final save, and the scalar baselines are norm-inflated
-without it.
-
-## Synthetic experiments
-
-Both generate their own data, so they need no LLM, no cached activations and no checkpoint.
-
-Feature splitting against intrinsic dimension. Plants features of known `d_i` with every
-other factor held fixed and counts how many atoms each architecture spends per feature.
-This is the experiment behind the figure above:
+**Automated interpretability.** Generate and score feature descriptions with SAEBench's AutoInterp
+evaluation, using gpt-4o-mini through OpenAI's Batch API. Set `OPENAI_API_KEY`, then run the stages in order:
 
 ```bash
-python -m experiments.synthetic_dimension --tag main
+python -m eval.autointerp prepare
+python -m eval.autointerp explain
+python -m eval.autointerp score
+python -m eval.autointerp results
 ```
 
-Rank recovery. Plants subspaces of known dimension and sweeps the nuclear coefficient to
-check the penalty drives each group's effective rank to the true `d_i`:
+Only `prepare` needs a GPU; `explain` and `score` wait for batch jobs and resume unfinished work when rerun.
+
+**Reconstruction and absorption plot.** This compares SASA, TopK, BatchTopK and Matryoshka. First run the core and
+both absorption evaluations for their 24,576-column checkpoints at sparsity settings 60, 120 and 240 (using rank 6
+for SASA), then generate the plot:
 
 ```bash
-python -m experiments.synthetic_rank --tag main
+python -m figures.grid
 ```
 
-The defaults are the paper's settings (8k and 20k steps, three seeds, six architectures or
-six coefficients) and take a few hours each; `--steps`, `--seeds` and `--archs`/`--lambdas`
-cut that down. Both write to `results/reports/<name>/<tag>/results.json`.
-
-## Causal intervention
-
-Whether a SASA group *is* the concept rather than merely correlating with it, tested by
-intervening on the group and reading the effect off the model's own predictions. This runs
-on Mistral-7B v0.1 at `blocks.19.hook_resid_post`.
-
-`checkpoints/topk_sasa_mistral7b_l19_n8192_r4_k15` is the model behind these numbers
-(`K=8192, r=4, s=15`, so `m=32768`, `l0=60`); it comes down with `git lfs pull`.
-
-`screen.py` ranks groups per concept by synthetic AUC, keeping those above 0.80 corpus AUC
-on a held-out Pile slice; the top group per concept is `--g-*` and the second-best is the
-`--runner-*` control:
+**Subspace overlap.** Measure shared directions among the 500 most active SASA groups:
 
 ```bash
-CKPT=checkpoints/topk_sasa_mistral7b_l19_n8192_r4_k15
-
-python -m experiments.screen --ckpt $CKPT --out results/screen.json
-python -m experiments.concept_causal --ckpt $CKPT \
-  --g-weekday 5596 --g-month 4502 --out results/concept_causal.json
-python -m experiments.ablation_table --ckpt $CKPT \
-  --g-weekday 5596 --g-month 4502 --runner-weekday 7444 --runner-month 3372 \
-  --out results/ablation_table.json
+python -m eval.overlap gpt2_l7/sasa_r6_l060_w12288
 ```
 
-Those indices are the screening result for this checkpoint: weekday and month both reach
-synthetic AUC 1.000, at corpus AUC 1.000 and 0.859. Group indices are not stable across
-training runs, so re-run `screen.py` against any other checkpoint. To train one:
+### Mistral-7B
+
+For the absorption comparison and feature visualizations, also download Engels et al.'s pretrained SAE,
+`Mistral-7B-v0.1_blocks.8.hook_resid_pre_65536_final.pt`, through
+[their repository](https://github.com/JoshEngels/MultiDimensionalFeatures), then convert it:
 
 ```bash
-python -m scripts.train_sasa \
-  --model-name mistralai/Mistral-7B-v0.1 --hook-name blocks.19.hook_resid_post --d-in 4096 \
-  --n-groups 8192 --group-rank 4 --k-groups 15 --save-dir $SASA_CHECKPOINTS
+python -m eval.dictionaries Mistral-7B-v0.1_blocks.8.hook_resid_pre_65536_final.pt
+```
+
+**Feature absorption.** Compare SASA with the Engels et al. baseline on the first-letter benchmark, using the
+default three seeds:
+
+```bash
+python -m eval.absorption prep letters mistral_l8
+python -m eval.absorption score letters mistral_l8/sasa_r8_k10 mistral_l8/engels_relu_w65536
+```
+
+**Causal interventions.** Measure how removing or changing a SASA feature affects the language
+model's predictions:
+
+```bash
+python -m eval.causal mistral_l8/sasa_r8_k10
+```
+
+**Feature visualizations.** Collect the activations, then plot the learned feature structure:
+
+```bash
+python -m eval.real_manifolds && python -m figures.real_manifolds
+```
+
+### Synthetic experiments
+
+These experiments generate activations with known feature structure and require no language model or checkpoint.
+
+```bash
+python -m synthetic.feature_dimension
+python -m synthetic.rank_adaptivity
+python -m synthetic.manifolds
+python -m figures.synthetic_manifolds
+```
+
+<details>
+<summary>File locations and reporting results</summary>
+
+By default, checkpoints, cached activations, results and evaluation data live in `checkpoints/`, `activations/`,
+`results/` and `data/`. Override these locations with `SASA_CHECKPOINTS`, `SASA_ACTIVATIONS`, `SASA_RESULTS` and
+`SASA_DATA`, respectively. If you change `SASA_CHECKPOINTS`, use the same location in the download commands.
+
+Each evaluation writes its results under `results/` (or `SASA_RESULTS`):
+
+| Evaluation | Result location |
+| --- | --- |
+| Reconstruction and model behavior | `core/gpt2_l7/` |
+| Feature absorption | `absorption/<letters or families>/<config>/<checkpoint>/seed<k>.json` |
+| Member prediction | `member_prediction/gpt2_l7.json` |
+| Automated interpretability | `autointerp/results.json` |
+| Subspace overlap | `overlap/gpt2_l7/sasa_r6_l060_w12288/overlap.json` |
+| Causal interventions | `causal/mistral_l8/sasa_r8_k10/causal.json` |
+| Synthetic experiments | `synthetic/` |
+
+For evaluations with multiple seeds or train/test splits, report the mean and, where shown in the paper, the sample
+standard deviation. Convert fractional scores to percentages when matching percentage-based table entries.
+
+</details>
+
+## Repository structure
+
+| Path | Contents |
+| --- | --- |
+| [sasa/](sasa/) | SASA model implementation |
+| [configs/](configs/) | Training settings for GPT-2 and Mistral-7B |
+| [cache.py](cache.py), [train.py](train.py) | Activation caching and model training |
+| [eval/](eval/) | Evaluations on language models |
+| [synthetic/](synthetic/) | Experiments with generated features of known dimension |
+| [figures/](figures/) | Scripts to plot the results |
+| [data/](data/) | Evaluation data and the released Mistral model's activation threshold |
+
+## Citation
+
+```bibtex
+@inproceedings{dalili2026sasa,
+  title     = {Subspace-Aware Sparse Autoencoders for Effective Mechanistic Interpretability},
+  author    = {Dalili, Seyed Arshan and Mahdavi, Mehrdad},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2026}
+}
 ```

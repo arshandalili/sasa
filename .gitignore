@@ -4,23 +4,15 @@ __pycache__/
 .venv/
 venv/
 .cache/
-.ipynb_checkpoints/
-wandb/
-scratch/
-results/
-# the paper model plus the 16 matched-budget sweep cells; other runs stay local
-checkpoints/*
-!checkpoints/topk_sasa_gpt2_l7_n2048_r6_k10/
-!checkpoints/topk_gpt2_l7_l0*/
-!checkpoints/batchtopk_gpt2_l7_l0*/
-!checkpoints/matryoshka_gpt2_l7_l0*/
-!checkpoints/topk_sasa_gpt2_l7_r6_nuc100_l0*/
-!checkpoints/topk_sasa_mistral7b_l19_*/
-output/
-# per-run eval scratch
-artifacts/absorption/*_k_sparse_probing.json
 
-# API keys - never commit
-openai.txt
-openai_key.txt
+# outputs (paths.py) and data that the evaluations rebuild
+activations/
+checkpoints/
+results/
+data/**/data.npz
+data/*/family_states.pt
+data/*/background.pt
+
 *.key
+openai*.txt
+api.txt

@@ -1,23 +1,17 @@
-# Requires Python >=3.10; sae-lens has no 3.9 release.
+# Python 3.10, with the versions that trained and evaluated the paper's models.
 sae-lens==6.25.0
 sae_bench @ git+https://github.com/adamkarvonen/SAEBench@fbc649fd2c336f5a383ff6840ecac740d485f3d6
 torch==2.9.0
 transformer-lens==2.16.1
 transformers==4.56.2
 datasets==3.6.0
-safetensors
-einops
 numpy==1.26.4
-scipy
+safetensors
 scikit-learn
+scipy
 pandas
-statsmodels
 matplotlib
 seaborn
-plotly
-tqdm
-wandb
-python-igraph
-leidenalg
-openai
-zstandard
+pyyaml
+huggingface_hub
+openai==2.14.0
